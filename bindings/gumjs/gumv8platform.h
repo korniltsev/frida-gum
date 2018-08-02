@@ -10,15 +10,21 @@
 #include "gumv8bundle.h"
 #include "gumscriptscheduler.h"
 
+#include <map>
 #include <v8-platform.h>
 
-class GumV8DisposeRequest;
+class GumV8Operation;
 class GumV8TaskRequest;
+class GumV8MainContextOperation;
+class GumV8PlatformLocker;
+class GumV8PlatformUnlocker;
 
 class GumV8Platform : public v8::Platform
 {
 public:
   GumV8Platform ();
+  GumV8Platform (const GumV8Platform &) = delete;
+  GumV8Platform & operator= (const GumV8Platform &) = delete;
   ~GumV8Platform ();
 
   v8::Isolate * GetIsolate () const { return isolate; }
@@ -30,6 +36,13 @@ public:
   const gchar * GetJavaSourceMap () const;
   GumV8Bundle * GetDebugBundle () const { return debug_bundle; }
   GumScriptScheduler * GetScheduler () const { return scheduler; }
+  std::shared_ptr<GumV8Operation> ScheduleOnJSThread (std::function<void ()> f);
+  std::shared_ptr<GumV8Operation> ScheduleOnJSThread (gint priority,
+      std::function<void ()> f);
+  std::shared_ptr<GumV8Operation> ScheduleOnJSThreadDelayed (
+      guint delay_in_milliseconds, std::function<void ()> f);
+  std::shared_ptr<GumV8Operation> ScheduleOnJSThreadDelayed (
+      guint delay_in_milliseconds, gint priority, std::function<void ()> f);
 
   int NumberOfWorkerThreads () override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner (
@@ -37,13 +50,12 @@ public:
   void CallOnWorkerThread (std::unique_ptr<v8::Task> task) override;
   void CallDelayedOnWorkerThread (std::unique_ptr<v8::Task> task,
       double delay_in_seconds) override;
-  void CallOnForegroundThread (v8::Isolate * for_isolate,
-      v8::Task * task) override;
-  void CallDelayedOnForegroundThread (v8::Isolate * for_isolate,
-      v8::Task * task, double delay_in_seconds) override;
-  void CallIdleOnForegroundThread (v8::Isolate * for_isolate,
+  void CallOnForegroundThread (v8::Isolate * isolate, v8::Task * task) override;
+  void CallDelayedOnForegroundThread (v8::Isolate * isolate, v8::Task * task,
+      double delay_in_seconds) override;
+  void CallIdleOnForegroundThread (v8::Isolate * isolate,
       v8::IdleTask * task) override;
-  bool IdleTasksEnabled (v8::Isolate * for_isolate) override;
+  bool IdleTasksEnabled (v8::Isolate * isolate) override;
   double MonotonicallyIncreasingTime () override;
   double CurrentClockTimeMillis () override;
   v8::MemoryBackend * GetMemoryBackend () override;
@@ -52,14 +64,12 @@ public:
 
 private:
   void InitRuntime ();
-  static void PerformDispose (GumV8DisposeRequest * dispose_request);
-  void Dispose (GumV8DisposeRequest * dispose_request);
+  void Dispose ();
   static void OnFatalError (const char * location, const char * message);
 
+  static gboolean PerformMainContextOperation (gpointer data);
+  static gboolean ReleaseMainContextOperation (gpointer data);
   static void HandleBackgroundTaskRequest (GumV8TaskRequest * request);
-  static gboolean HandleForegroundTaskRequest (GumV8TaskRequest * request);
-  void ScheduleForegroundTask (GumV8TaskRequest * request, GSource * source);
-  void OnForegroundTaskPerformed (GumV8TaskRequest * request);
 
   GMutex lock;
   v8::Isolate * isolate;
@@ -68,17 +78,28 @@ private:
   GumV8Bundle * java_bundle;
   GumV8Bundle * debug_bundle;
   GumScriptScheduler * scheduler;
+  std::map<v8::Isolate *, std::shared_ptr<v8::TaskRunner>> foreground_runners;
   const gint64 start_time;
   v8::ArrayBuffer::Allocator * array_buffer_allocator;
   v8::MemoryBackend * memory_backend;
   v8::ThreadingBackend * threading_backend;
   v8::TracingController * tracing_controller;
-  GHashTable * pending_foreground_tasks;
 
-  GumV8Platform (const GumV8Platform &);
-  void operator= (const GumV8Platform &);
+  friend class GumV8MainContextOperation;
+  friend class GumV8PlatformLocker;
+  friend class GumV8PlatformUnlocker;
+};
 
-  friend class GumV8DisposeRequest;
+class GumV8Operation
+{
+public:
+  GumV8Operation () = default;
+  GumV8Operation (const GumV8Operation &) = delete;
+  GumV8Operation & operator= (const GumV8Operation &) = delete;
+  virtual ~GumV8Operation () = default;
+
+  virtual void Cancel () = 0;
+  virtual void Await () = 0;
 };
 
 #endif

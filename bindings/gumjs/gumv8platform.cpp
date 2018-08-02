@@ -16,238 +16,157 @@
 
 using namespace v8;
 
-class GumV8DisposeRequest
+class GumV8MainContextOperation : public GumV8Operation
 {
 public:
-  GumV8DisposeRequest (GumV8Platform * platform)
-    : platform (platform),
-      completed (false)
-  {
-    g_cond_init (&cond);
-  }
+  GumV8MainContextOperation (GumV8Platform * platform,
+      std::function<void ()> func, GSource * source);
+  ~GumV8MainContextOperation () override;
 
-  ~GumV8DisposeRequest ()
-  {
-    g_cond_clear (&cond);
-  }
-
-  void
-  Await ()
-  {
-    g_mutex_lock (&platform->lock);
-    while (!completed)
-      g_cond_wait (&cond, &platform->lock);
-    g_mutex_unlock (&platform->lock);
-  }
-
-  void
-  Complete ()
-  {
-    g_mutex_lock (&platform->lock);
-    completed = true;
-    g_cond_signal (&cond);
-    g_mutex_unlock (&platform->lock);
-  }
+  void Perform ();
+  void Cancel () override;
+  void Await () override;
 
 private:
   GumV8Platform * platform;
+  std::function<void ()> func;
+  GSource * source;
+  volatile bool completed;
   GCond cond;
-  bool completed;
+};
 
-  friend class GumV8Platform;
+class GumV8ForegroundTaskRunner : public TaskRunner
+{
+public:
+  GumV8ForegroundTaskRunner (GumV8Platform * platform, Isolate * isolate);
+  ~GumV8ForegroundTaskRunner () override;
+
+  void Clear ();
+
+  void PostTask (std::unique_ptr<Task> task) override;
+  void PostDelayedTask (std::unique_ptr<Task> task,
+      double delay_in_seconds) override;
+  void PostIdleTask (std::unique_ptr<IdleTask> task) override;
+  bool IdleTasksEnabled () override;
+
+  Platform * GetPlatform () const;
+
+private:
+  GumV8ForegroundTaskRunner (const GumV8ForegroundTaskRunner &) = delete;
+  void operator= (const GumV8ForegroundTaskRunner &) = delete;
+
+  void ScheduleTask (GumV8TaskRequest * request, GSource * source);
+  static gboolean HandleTaskRequest (GumV8TaskRequest * request);
+  void OnTaskPerformed (GumV8TaskRequest * request);
+
+  GumV8Platform * platform;
+  Isolate * isolate;
+  GHashTable * pending;
 };
 
 class GumV8TaskRequest
 {
 public:
-  GumV8TaskRequest (GumV8Platform * platform,
-                    Isolate * isolate)
-    : platform (platform),
-      isolate (isolate)
-  {
-  }
-
+  GumV8TaskRequest () = default;
   virtual ~GumV8TaskRequest () = default;
-
-  void
-  ClearIsolate ()
-  {
-    isolate = nullptr;
-  }
 
   virtual void Perform () = 0;
 
 protected:
-  GumV8Platform * platform;
-  Isolate * isolate;
-
-  friend class GumV8Platform;
+  GumV8TaskRequest (const GumV8TaskRequest &) = delete;
+  void operator= (const GumV8TaskRequest &) = delete;
 };
 
 class GumV8PlainTaskRequest : public GumV8TaskRequest
 {
 public:
-  GumV8PlainTaskRequest (GumV8Platform * platform,
-                         Isolate * isolate,
-                         std::unique_ptr<Task> task)
-    : GumV8TaskRequest (platform, isolate),
-      task (std::move (task))
-  {
-  }
+  GumV8PlainTaskRequest (GumV8ForegroundTaskRunner * runner,
+      std::unique_ptr<Task> task);
 
-  void
-  Perform ()
-  {
-    if (isolate != nullptr)
-    {
-      Locker locker (isolate);
-      Isolate::Scope isolate_scope (isolate);
-      HandleScope handle_scope (isolate);
-
-      task->Run ();
-    }
-    else
-    {
-      task->Run ();
-    }
-  }
+  void Perform () override;
 
 private:
+  GumV8PlainTaskRequest (const GumV8PlainTaskRequest &) = delete;
+  void operator= (const GumV8PlainTaskRequest &) = delete;
+
   std::unique_ptr<Task> task;
 };
 
 class GumV8IdleTaskRequest : public GumV8TaskRequest
 {
 public:
-  GumV8IdleTaskRequest (GumV8Platform * platform,
-                        Isolate * isolate,
-                        IdleTask * task)
-    : GumV8TaskRequest (platform, isolate),
-      task (task)
-  {
-  }
+  GumV8IdleTaskRequest (GumV8ForegroundTaskRunner * runner,
+      std::unique_ptr<IdleTask> task);
 
-  ~GumV8IdleTaskRequest ()
-  {
-    delete task;
-  }
-
-  void
-  Perform ()
-  {
-    if (isolate != nullptr)
-    {
-      Locker locker (isolate);
-      Isolate::Scope isolate_scope (isolate);
-      HandleScope handle_scope (isolate);
-
-      RunTask ();
-    }
-    else
-    {
-      RunTask ();
-    }
-  }
+  void Perform () override;
 
 private:
-  void
-  RunTask ()
-  {
-    const double deadline_in_seconds =
-        platform->MonotonicallyIncreasingTime () + (1.0 / 60.0);
-    task->Run (deadline_in_seconds);
-  }
+  GumV8IdleTaskRequest (const GumV8IdleTaskRequest &) = delete;
+  void operator= (const GumV8IdleTaskRequest &) = delete;
 
-  IdleTask * task;
+  std::unique_ptr<IdleTask> task;
 };
 
-class GumMemoryBackend : public MemoryBackend
+class GumV8ArrayBufferAllocator : public ArrayBuffer::Allocator
 {
 public:
-  void *
-  Allocate (void * address,
-            const size_t size,
-            bool is_executable) override
-  {
-    gpointer base = gum_memory_allocate (size,
-        is_executable ? GUM_PAGE_RWX : GUM_PAGE_RW, address);
-    if (base != NULL)
-      Cloak (base, size);
-    return base;
-  }
+  GumV8ArrayBufferAllocator () = default;
 
-  bool
-  Free (void * address,
-        size_t size) override
-  {
-    bool success = !!gum_memory_release (address, size);
-    if (success)
-      Uncloak (address, size);
-    return success;
-  }
-
-  bool
-  Release (void * address,
-           size_t size) override
-  {
-    // FIXME
-    return Free (address, size);
-  }
+  void * Allocate (size_t length) override;
+  void * AllocateUninitialized (size_t length) override;
+  void Free (void * data, size_t length) override;
 
 private:
-  void
-  Cloak (gpointer base,
-         gsize size)
-  {
-    GumMemoryRange r;
-    r.base_address = GUM_ADDRESS (base);
-    r.size = size;
-    gum_cloak_add_range (&r);
-  }
+  GumV8ArrayBufferAllocator (const GumV8ArrayBufferAllocator &) = delete;
+  void operator= (const GumV8ArrayBufferAllocator &) = delete;
+};
 
-  void
-  Uncloak (gpointer base,
-           gsize size)
-  {
-    GumMemoryRange r;
-    r.base_address = GUM_ADDRESS (base);
-    r.size = size;
-    gum_cloak_remove_range (&r);
-  }
+class GumV8MemoryBackend : public MemoryBackend
+{
+public:
+  GumV8MemoryBackend () = default;
+
+  void * Allocate (void * address, const size_t size, bool is_executable)
+      override;
+  bool Free (void * address, size_t size) override;
+  bool Release (void * address, size_t size) override;
+
+private:
+  GumV8MemoryBackend (const GumV8MemoryBackend &) = delete;
+  void operator= (const GumV8MemoryBackend &) = delete;
+
+  static void Cloak (gpointer base, gsize size);
+  static void Uncloak (gpointer base, gsize size);
+};
+
+class GumV8ThreadingBackend : public ThreadingBackend
+{
+public:
+  GumV8ThreadingBackend () = default;
+
+  MutexImpl * CreatePlainMutex () override;
+  MutexImpl * CreateRecursiveMutex () override;
+  ConditionVariableImpl * CreateConditionVariable () override;
+
+private:
+  GumV8ThreadingBackend (const GumV8ThreadingBackend &) = delete;
+  void operator= (const GumV8ThreadingBackend &) = delete;
 };
 
 class GumMutex : public MutexImpl
 {
 public:
-  GumMutex ()
-  {
-    g_mutex_init (&mutex);
-  }
+  GumMutex ();
+  ~GumMutex () override;
 
-  ~GumMutex () override
-  {
-    g_mutex_clear (&mutex);
-  }
-
-  void
-  Lock () override
-  {
-    g_mutex_lock (&mutex);
-  }
-
-  void
-  Unlock () override
-  {
-    g_mutex_unlock (&mutex);
-  }
-
-  bool
-  TryLock () override
-  {
-    return !!g_mutex_trylock (&mutex);
-  }
+  void Lock () override;
+  void Unlock () override;
+  bool TryLock () override;
 
 private:
+  GumMutex (const GumMutex &) = delete;
+  void operator= (const GumMutex &) = delete;
+
   GMutex mutex;
 
   friend class GumConditionVariable;
@@ -256,128 +175,78 @@ private:
 class GumRecursiveMutex : public MutexImpl
 {
 public:
-  GumRecursiveMutex ()
-  {
-    g_rec_mutex_init (&mutex);
-  }
+  GumRecursiveMutex ();
+  ~GumRecursiveMutex () override;
 
-  ~GumRecursiveMutex () override
-  {
-    g_rec_mutex_clear (&mutex);
-  }
-
-  void
-  Lock () override
-  {
-    g_rec_mutex_lock (&mutex);
-  }
-
-  void
-  Unlock () override
-  {
-    g_rec_mutex_unlock (&mutex);
-  }
-
-  bool
-  TryLock () override
-  {
-    return !!g_rec_mutex_trylock (&mutex);
-  }
+  void Lock () override;
+  void Unlock () override;
+  bool TryLock () override;
 
 private:
+  GumRecursiveMutex (const GumRecursiveMutex &) = delete;
+  void operator= (const GumRecursiveMutex &) = delete;
+
   GRecMutex mutex;
 };
 
 class GumConditionVariable : public ConditionVariableImpl
 {
 public:
-  GumConditionVariable ()
-  {
-    g_cond_init (&cond);
-  }
+  GumConditionVariable ();
+  ~GumConditionVariable () override;
 
-  ~GumConditionVariable () override
-  {
-    g_cond_clear (&cond);
-  }
-
-  void
-  NotifyOne () override
-  {
-    g_cond_signal (&cond);
-  }
-
-  void
-  NotifyAll () override
-  {
-    g_cond_broadcast (&cond);
-  }
-
-  void
-  Wait (MutexImpl * mutex) override
-  {
-    GumMutex * m = (GumMutex *) mutex;
-    g_cond_wait (&cond, &m->mutex);
-  }
-
-  bool
-  WaitFor (MutexImpl * mutex,
-           int64_t delta_in_microseconds) override
-  {
-    GumMutex * m = (GumMutex *) mutex;
-    gint64 deadline = g_get_monotonic_time () + delta_in_microseconds;
-    return !!g_cond_wait_until (&cond, &m->mutex, deadline);
-  }
+  void NotifyOne () override;
+  void NotifyAll () override;
+  void Wait (MutexImpl * mutex) override;
+  bool WaitFor (MutexImpl * mutex, int64_t delta_in_microseconds) override;
 
 private:
+  GumConditionVariable (const GumConditionVariable &) = delete;
+  void operator= (const GumConditionVariable &) = delete;
+
   GCond cond;
 };
 
-class GumThreadingBackend : public ThreadingBackend
+class GumV8PlatformLocker
 {
 public:
-  MutexImpl *
-  CreatePlainMutex () override
+  GumV8PlatformLocker (GumV8Platform * platform)
+    : platform (platform)
   {
-    return new GumMutex ();
+    g_mutex_lock (&platform->lock);
   }
 
-  MutexImpl *
-  CreateRecursiveMutex () override
+  ~GumV8PlatformLocker ()
   {
-    return new GumRecursiveMutex ();
+    g_mutex_unlock (&platform->lock);
   }
 
-  ConditionVariableImpl *
-  CreateConditionVariable () override
-  {
-    return new GumConditionVariable ();
-  }
+private:
+  GumV8PlatformLocker (const GumV8PlatformLocker &) = delete;
+  void operator= (const GumV8PlatformLocker &) = delete;
+
+  GumV8Platform * platform;
 };
 
-class GumArrayBufferAllocator : public ArrayBuffer::Allocator
+class GumV8PlatformUnlocker
 {
 public:
-  void *
-  Allocate (size_t length) override
+  GumV8PlatformUnlocker (GumV8Platform * platform)
+    : platform (platform)
   {
-    return g_malloc0 (length);
+    g_mutex_unlock (&platform->lock);
   }
 
-  void *
-  AllocateUninitialized (size_t length) override
+  ~GumV8PlatformUnlocker ()
   {
-    return g_malloc (length);
+    g_mutex_lock (&platform->lock);
   }
 
-  void
-  Free (void * data,
-        size_t length) override
-  {
-    (void) length;
+private:
+  GumV8PlatformUnlocker (const GumV8PlatformUnlocker &) = delete;
+  void operator= (const GumV8PlatformUnlocker &) = delete;
 
-    g_free (data);
-  }
+  GumV8Platform * platform;
 };
 
 GumV8Platform::GumV8Platform ()
@@ -385,11 +254,10 @@ GumV8Platform::GumV8Platform ()
     java_bundle (NULL),
     scheduler (gum_script_scheduler_new ()),
     start_time (g_get_monotonic_time ()),
-    array_buffer_allocator (new GumArrayBufferAllocator ()),
-    memory_backend (new GumMemoryBackend ()),
-    threading_backend (new GumThreadingBackend ()),
-    tracing_controller (new TracingController ()),
-    pending_foreground_tasks (g_hash_table_new (NULL, NULL))
+    array_buffer_allocator (new GumV8ArrayBufferAllocator ()),
+    memory_backend (new GumV8MemoryBackend ()),
+    threading_backend (new GumV8ThreadingBackend ()),
+    tracing_controller (new TracingController ())
 {
   g_mutex_init (&lock);
 
@@ -407,12 +275,8 @@ GumV8Platform::GumV8Platform ()
 
 GumV8Platform::~GumV8Platform ()
 {
-  GumV8DisposeRequest request (this);
-  gum_script_scheduler_push_job_on_js_thread (scheduler, G_PRIORITY_HIGH,
-      (GumScriptJobFunc) PerformDispose, &request, NULL);
-  request.Await ();
-
-  g_hash_table_unref (pending_foreground_tasks);
+  auto dispose = ScheduleOnJSThread (G_PRIORITY_HIGH, [=]() { Dispose (); });
+  dispose->Await ();
 
   g_object_unref (scheduler);
 
@@ -438,13 +302,7 @@ GumV8Platform::InitRuntime ()
 }
 
 void
-GumV8Platform::PerformDispose (GumV8DisposeRequest * dispose_request)
-{
-  dispose_request->platform->Dispose (dispose_request);
-}
-
-void
-GumV8Platform::Dispose (GumV8DisposeRequest * dispose_request)
+GumV8Platform::Dispose ()
 {
   {
     Locker locker (isolate);
@@ -460,35 +318,14 @@ GumV8Platform::Dispose (GumV8DisposeRequest * dispose_request)
 
   isolate->Dispose ();
 
-  g_mutex_lock (&lock);
-
-  while (g_hash_table_size (pending_foreground_tasks) > 0)
   {
-    GHashTableIter iter;
-    GumV8TaskRequest * request;
-    GSource * source;
+    GumV8PlatformLocker locker (this);
 
-    g_hash_table_iter_init (&iter, pending_foreground_tasks);
-    g_hash_table_iter_next (&iter, (gpointer *) &request, (gpointer *) &source);
-    g_hash_table_iter_remove (&iter);
-
-    g_mutex_unlock (&lock);
-
-    g_source_destroy (source);
-
-    request->ClearIsolate ();
-    request->Perform ();
-    delete request;
-
-    g_mutex_lock (&lock);
+    // FIXME: dispose runners
   }
-
-  g_mutex_unlock (&lock);
 
   V8::Dispose ();
   V8::ShutdownPlatform ();
-
-  dispose_request->Complete ();
 }
 
 void
@@ -532,6 +369,65 @@ GumV8Platform::GetJavaSourceMap () const
   return gumjs_java_source_map;
 }
 
+std::shared_ptr<GumV8Operation>
+GumV8Platform::ScheduleOnJSThread (std::function<void ()> f)
+{
+  return ScheduleOnJSThreadDelayed (0, G_PRIORITY_DEFAULT, f);
+}
+
+std::shared_ptr<GumV8Operation>
+GumV8Platform::ScheduleOnJSThread (gint priority,
+                                   std::function<void ()> f)
+{
+  return ScheduleOnJSThreadDelayed (0, priority, f);
+}
+
+std::shared_ptr<GumV8Operation>
+GumV8Platform::ScheduleOnJSThreadDelayed (guint delay_in_milliseconds,
+                                          std::function<void ()> f)
+{
+  return ScheduleOnJSThreadDelayed (delay_in_milliseconds, G_PRIORITY_DEFAULT,
+      f);
+}
+
+std::shared_ptr<GumV8Operation>
+GumV8Platform::ScheduleOnJSThreadDelayed (guint delay_in_milliseconds,
+                                          gint priority,
+                                          std::function<void ()> f)
+{
+  GSource * source = (delay_in_milliseconds != 0)
+      ? g_timeout_source_new (delay_in_milliseconds)
+      : g_idle_source_new ();
+  g_source_set_priority (source, priority);
+
+  auto operation =
+      std::make_shared (new GumV8MainContextOperation (this, f, source));
+  g_source_set_callback (source, PerformMainContextOperation,
+      new std::shared_ptr<GumV8Operation> (operation),
+      ReleaseMainContextOperation);
+  g_source_attach (source, gum_script_scheduler_get_js_context (scheduler));
+
+  return operation;
+}
+
+gboolean
+GumV8Platform::PerformMainContextOperation (gpointer data)
+{
+  std::shared_ptr<GumV8Operation> * operation = (GumV8Operation *) data;
+
+  *operation->Perform ();
+
+  return FALSE;
+}
+
+gboolean
+GumV8Platform::ReleaseMainContextOperation (gpointer data)
+{
+  std::shared_ptr<GumV8Operation> * operation = (GumV8Operation *) data;
+
+  delete operation;
+}
+
 int
 GumV8Platform::NumberOfWorkerThreads ()
 {
@@ -541,7 +437,14 @@ GumV8Platform::NumberOfWorkerThreads ()
 std::shared_ptr<TaskRunner>
 GumV8Platform::GetForegroundTaskRunner (Isolate * isolate)
 {
-  return nullptr; // FIXME
+  auto runner = foreground_runners[isolate];
+  if (!runner)
+  {
+    runner = new GumV8ForegroundTaskRunner (this, isolate);
+    foreground_runners[isolate] = runner;
+  }
+
+  return runner;
 }
 
 void
@@ -561,43 +464,31 @@ GumV8Platform::CallDelayedOnWorkerThread (std::unique_ptr<Task> task,
 }
 
 void
-GumV8Platform::CallOnForegroundThread (Isolate * for_isolate,
+GumV8Platform::CallOnForegroundThread (Isolate * isolate,
                                        Task * task)
 {
-  auto request = new GumV8PlainTaskRequest (this, for_isolate,
-      std::unique_ptr<Task> (task));
-
-  auto source = g_idle_source_new ();
-  g_source_set_priority (source, G_PRIORITY_DEFAULT);
-  ScheduleForegroundTask (request, source);
+  GetForegroundTaskRunner (isolate)->PostTask (std::unique_ptr<Task> (task));
 }
 
 void
-GumV8Platform::CallDelayedOnForegroundThread (Isolate * for_isolate,
+GumV8Platform::CallDelayedOnForegroundThread (Isolate * isolate,
                                               Task * task,
                                               double delay_in_seconds)
 {
-  auto request = new GumV8PlainTaskRequest (this, for_isolate,
-      std::unique_ptr<Task> (task));
-
-  auto source = g_timeout_source_new (delay_in_seconds * 1000.0);
-  g_source_set_priority (source, G_PRIORITY_LOW);
-  ScheduleForegroundTask (request, source);
+  GetForegroundTaskRunner (isolate)->PostDelayedTask (
+      std::unique_ptr<Task> (task), delay_in_seconds);
 }
 
 void
-GumV8Platform::CallIdleOnForegroundThread (Isolate * for_isolate,
+GumV8Platform::CallIdleOnForegroundThread (Isolate * isolate,
                                            IdleTask * task)
 {
-  auto request = new GumV8IdleTaskRequest (this, for_isolate, task);
-
-  auto source = g_idle_source_new ();
-  g_source_set_priority (source, G_PRIORITY_LOW);
-  ScheduleForegroundTask (request, source);
+  GetForegroundTaskRunner (isolate)->PostIdleTask (
+      std::unique_ptr<Task> (task));
 }
 
 bool
-GumV8Platform::IdleTasksEnabled (Isolate * for_isolate)
+GumV8Platform::IdleTasksEnabled (Isolate * isolate)
 {
   return true;
 }
@@ -641,12 +532,161 @@ GumV8Platform::HandleBackgroundTaskRequest (GumV8TaskRequest * request)
   delete request;
 }
 
-gboolean
-GumV8Platform::HandleForegroundTaskRequest (GumV8TaskRequest * request)
+GumV8MainContextOperation::GumV8MainContextOperation (
+    GumV8Platform * platform,
+    std::function<void ()> func,
+    GSource * source)
+  : platform (platform),
+    func (func),
+    source (source),
+    completed (false)
 {
-  request->Perform ();
+  g_cond_init (&cond);
+}
 
-  request->platform->OnForegroundTaskPerformed (request);
+GumV8MainContextOperation::~GumV8MainContextOperation ()
+{
+  g_source_unref (source);
+  g_cond_clear (&cond);
+}
+
+void
+GumV8MainContextOperation::Perform ()
+{
+  func ();
+
+  GumV8PlatformLocker locker (platform);
+  completed = true;
+  g_cond_signal (&cond);
+}
+
+void
+GumV8MainContextOperation::Cancel ()
+{
+  g_source_destroy (source);
+
+  GumV8PlatformLocker locker (platform);
+  completed = true;
+  g_cond_signal (&cond);
+}
+
+void
+GumV8MainContextOperation::Await ()
+{
+  GumV8PlatformLocker locker (platform);
+  while (!completed)
+    g_cond_wait (&cond, &platform->lock);
+}
+
+GumV8ForegroundTaskRunner::GumV8ForegroundTaskRunner (GumV8Platform * platform,
+                                                      Isolate * isolate)
+  : platform (platform),
+    isolate (isolate),
+    pending (g_hash_table_new (NULL, NULL))
+{
+}
+
+GumV8ForegroundTaskRunner::~GumV8ForegroundTaskRunner ()
+{
+  g_hash_table_unref (pending);
+}
+
+void
+GumV8ForegroundTaskRunner::Clear ()
+{
+  while (g_hash_table_size (pending) > 0)
+  {
+    GHashTableIter iter;
+    GumV8TaskRequest * request;
+    GSource * source;
+
+    g_hash_table_iter_init (&iter, pending);
+    g_hash_table_iter_next (&iter, (gpointer *) &request, (gpointer *) &source);
+    g_hash_table_iter_remove (&iter);
+
+    {
+      GumV8PlatformUnlocker unlocker (platform);
+
+      g_source_destroy (source);
+
+      delete request;
+    }
+  }
+}
+
+void
+GumV8ForegroundTaskRunner::PostTask (std::unique_ptr<Task> task)
+{
+  auto request = new GumV8PlainTaskRequest (this, std::move (task));
+
+  auto source = g_idle_source_new ();
+  g_source_set_priority (source, G_PRIORITY_DEFAULT);
+  ScheduleTask (request, source);
+}
+
+void
+GumV8ForegroundTaskRunner::PostDelayedTask (std::unique_ptr<Task> task,
+                                            double delay_in_seconds)
+{
+  auto request = new GumV8PlainTaskRequest (this, std::move (task));
+
+  auto source = g_timeout_source_new (delay_in_seconds * 1000.0);
+  g_source_set_priority (source, G_PRIORITY_LOW);
+  ScheduleTask (request, source);
+}
+
+void
+GumV8ForegroundTaskRunner::PostIdleTask (std::unique_ptr<IdleTask> task)
+{
+  auto request = new GumV8IdleTaskRequest (this, std::move (task));
+
+  auto source = g_idle_source_new ();
+  g_source_set_priority (source, G_PRIORITY_LOW);
+  ScheduleTask (request, source);
+}
+
+bool
+GumV8ForegroundTaskRunner::IdleTasksEnabled ()
+{
+  return true;
+}
+
+Platform *
+GumV8ForegroundTaskRunner::GetPlatform () const
+{
+  return platform;
+}
+
+void
+GumV8ForegroundTaskRunner::ScheduleTask (GumV8TaskRequest * request,
+                                         GSource * source)
+{
+  g_source_set_callback (source, (GSourceFunc) HandleTaskRequest, request,
+      NULL);
+
+  {
+    GumV8PlatformLocker locker (platform);
+
+    g_hash_table_insert (pending, request, source);
+    g_source_attach (source,
+        gum_script_scheduler_get_js_context (platform->GetScheduler ()));
+  }
+
+  g_source_unref (source);
+}
+
+gboolean
+GumV8ForegroundTaskRunner::HandleTaskRequest (GumV8TaskRequest * request)
+{
+  {
+    Locker locker (isolate);
+    Isolate::Scope isolate_scope (isolate);
+    HandleScope handle_scope (isolate);
+
+    request->Perform ();
+  }
+
+  request->runner->OnTaskPerformed (request);
 
   delete request;
 
@@ -654,24 +694,218 @@ GumV8Platform::HandleForegroundTaskRequest (GumV8TaskRequest * request)
 }
 
 void
-GumV8Platform::ScheduleForegroundTask (GumV8TaskRequest * request,
-                                       GSource * source)
+GumV8ForegroundTaskRunner::OnTaskPerformed (GumV8TaskRequest * request)
 {
-  g_source_set_callback (source, (GSourceFunc) HandleForegroundTaskRequest,
-      request, NULL);
+  GumV8PlatformLocker locker (platform);
+  g_hash_table_remove (pending, request);
+}
 
-  g_mutex_lock (&lock);
-  g_hash_table_insert (pending_foreground_tasks, request, source);
-  g_source_attach (source, gum_script_scheduler_get_js_context (scheduler));
-  g_mutex_unlock (&lock);
-
-  g_source_unref (source);
+GumV8PlainTaskRequest::GumV8PlainTaskRequest (
+    GumV8ForegroundTaskRunner * runner,
+    std::unique_ptr<Task> task)
+  : GumV8TaskRequest (runner),
+    task (std::move (task))
+{
 }
 
 void
-GumV8Platform::OnForegroundTaskPerformed (GumV8TaskRequest * request)
+GumV8PlainTaskRequest::Perform ()
 {
-  g_mutex_lock (&lock);
-  g_hash_table_remove (pending_foreground_tasks, request);
-  g_mutex_unlock (&lock);
+  task->Run ();
+}
+
+GumV8IdleTaskRequest::GumV8IdleTaskRequest (GumV8ForegroundTaskRunner * runner,
+                                            std::unique_ptr<IdleTask> task)
+  : GumV8TaskRequest (runner),
+    task (std::move (task))
+{
+}
+
+void
+GumV8IdleTaskRequest::Perform ()
+{
+  const double deadline_in_seconds =
+      runner->GetPlatform ()->MonotonicallyIncreasingTime () + (1.0 / 60.0);
+  task->Run (deadline_in_seconds);
+}
+
+void *
+GumV8ArrayBufferAllocator::Allocate (size_t length)
+{
+  return g_malloc0 (length);
+}
+
+void *
+GumV8ArrayBufferAllocator::AllocateUninitialized (size_t length)
+{
+  return g_malloc (length);
+}
+
+void
+GumV8ArrayBufferAllocator::Free (void * data,
+                                 size_t length)
+{
+  g_free (data);
+}
+
+void *
+GumV8MemoryBackend::Allocate (void * address,
+                              const size_t size,
+                              bool is_executable)
+{
+  gpointer base = gum_memory_allocate (size,
+      is_executable ? GUM_PAGE_RWX : GUM_PAGE_RW, address);
+  if (base != NULL)
+    Cloak (base, size);
+  return base;
+}
+
+bool
+GumV8MemoryBackend::Free (void * address,
+                          size_t size)
+{
+  bool success = !!gum_memory_release (address, size);
+  if (success)
+    Uncloak (address, size);
+  return success;
+}
+
+bool
+GumV8MemoryBackend::Release (void * address,
+                             size_t size)
+{
+  // FIXME
+  return Free (address, size);
+}
+
+void
+GumV8MemoryBackend::Cloak (gpointer base,
+                           gsize size)
+{
+  GumMemoryRange r;
+  r.base_address = GUM_ADDRESS (base);
+  r.size = size;
+  gum_cloak_add_range (&r);
+}
+
+void
+GumV8MemoryBackend::Uncloak (gpointer base,
+                             gsize size)
+{
+  GumMemoryRange r;
+  r.base_address = GUM_ADDRESS (base);
+  r.size = size;
+  gum_cloak_remove_range (&r);
+}
+
+MutexImpl *
+GumV8ThreadingBackend::CreatePlainMutex ()
+{
+  return new GumMutex ();
+}
+
+MutexImpl *
+GumV8ThreadingBackend::CreateRecursiveMutex ()
+{
+  return new GumRecursiveMutex ();
+}
+
+ConditionVariableImpl *
+GumV8ThreadingBackend::CreateConditionVariable ()
+{
+  return new GumConditionVariable ();
+}
+
+GumMutex::GumMutex ()
+{
+  g_mutex_init (&mutex);
+}
+
+GumMutex::~GumMutex ()
+{
+  g_mutex_clear (&mutex);
+}
+
+void
+GumMutex::Lock ()
+{
+  g_mutex_lock (&mutex);
+}
+
+void
+GumMutex::Unlock ()
+{
+  g_mutex_unlock (&mutex);
+}
+
+bool
+GumMutex::TryLock ()
+{
+  return !!g_mutex_trylock (&mutex);
+}
+
+GumRecursiveMutex::GumRecursiveMutex ()
+{
+  g_rec_mutex_init (&mutex);
+}
+
+GumRecursiveMutex::~GumRecursiveMutex ()
+{
+  g_rec_mutex_clear (&mutex);
+}
+
+void
+GumRecursiveMutex::Lock ()
+{
+  g_rec_mutex_lock (&mutex);
+}
+
+void
+GumRecursiveMutex::Unlock ()
+{
+  g_rec_mutex_unlock (&mutex);
+}
+
+bool
+GumRecursiveMutex::TryLock ()
+{
+  return !!g_rec_mutex_trylock (&mutex);
+}
+
+GumConditionVariable::GumConditionVariable ()
+{
+  g_cond_init (&cond);
+}
+
+GumConditionVariable::~GumConditionVariable ()
+{
+  g_cond_clear (&cond);
+}
+
+void
+GumConditionVariable::NotifyOne ()
+{
+  g_cond_signal (&cond);
+}
+
+void
+GumConditionVariable::NotifyAll ()
+{
+  g_cond_broadcast (&cond);
+}
+
+void
+GumConditionVariable::Wait (MutexImpl * mutex)
+{
+  GumMutex * m = (GumMutex *) mutex;
+  g_cond_wait (&cond, &m->mutex);
+}
+
+bool
+GumConditionVariable::WaitFor (MutexImpl * mutex,
+                               int64_t delta_in_microseconds)
+{
+  GumMutex * m = (GumMutex *) mutex;
+  gint64 deadline = g_get_monotonic_time () + delta_in_microseconds;
+  return !!g_cond_wait_until (&cond, &m->mutex, deadline);
 }
