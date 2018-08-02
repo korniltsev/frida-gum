@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2017 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2018 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -62,8 +62,8 @@ class GumV8TaskRequest
 public:
   GumV8TaskRequest (GumV8Platform * platform,
                     Isolate * isolate)
-    : platform(platform),
-      isolate(isolate)
+    : platform (platform),
+      isolate (isolate)
   {
   }
 
@@ -89,15 +89,10 @@ class GumV8PlainTaskRequest : public GumV8TaskRequest
 public:
   GumV8PlainTaskRequest (GumV8Platform * platform,
                          Isolate * isolate,
-                         Task * task)
+                         std::unique_ptr<Task> task)
     : GumV8TaskRequest (platform, isolate),
-      task (task)
+      task (std::move (task))
   {
-  }
-
-  ~GumV8PlainTaskRequest ()
-  {
-    delete task;
   }
 
   void
@@ -118,7 +113,7 @@ public:
   }
 
 private:
-  Task * task;
+  std::unique_ptr<Task> task;
 };
 
 class GumV8IdleTaskRequest : public GumV8TaskRequest
@@ -170,64 +165,33 @@ class GumMemoryBackend : public MemoryBackend
 {
 public:
   void *
-  Allocate (const size_t size,
-            bool is_executable,
-            void * hint) override
+  Allocate (void * address,
+            const size_t size,
+            bool is_executable) override
   {
     gpointer base = gum_memory_allocate (size,
-        is_executable ? GUM_PAGE_RWX : GUM_PAGE_RW, hint);
-    if (base != NULL)
-      Cloak (base, size);
-    return base;
-  }
-
-  void *
-  Reserve (size_t size,
-           void * hint) override
-  {
-    gpointer base = gum_memory_reserve (size, hint);
+        is_executable ? GUM_PAGE_RWX : GUM_PAGE_RW, address);
     if (base != NULL)
       Cloak (base, size);
     return base;
   }
 
   bool
-  Commit (void * base,
-          size_t size,
-          bool is_executable) override
+  Free (void * address,
+        size_t size) override
   {
-    return !!gum_memory_commit (base, size,
-        is_executable ? GUM_PAGE_RWX : GUM_PAGE_RW);
-  }
-
-  bool
-  Uncommit (void * base,
-            size_t size) override
-  {
-    return !!gum_memory_uncommit (base, size);
-  }
-
-  bool
-  ReleasePartial (void * base,
-                  size_t size,
-                  void * free_start,
-                  size_t free_size) override
-  {
-    bool success =
-        !!gum_memory_release_partial (base, size, free_start, free_size);
+    bool success = !!gum_memory_release (address, size);
     if (success)
-      Uncloak (free_start, free_size);
+      Uncloak (address, size);
     return success;
   }
 
   bool
-  Release (void * base,
+  Release (void * address,
            size_t size) override
   {
-    bool success = !!gum_memory_release (base, size);
-    if (success)
-      Uncloak (base, size);
-    return success;
+    // FIXME
+    return Free (address, size);
   }
 
 private:
@@ -568,29 +532,40 @@ GumV8Platform::GetJavaSourceMap () const
   return gumjs_java_source_map;
 }
 
-size_t
-GumV8Platform::NumberOfAvailableBackgroundThreads ()
+int
+GumV8Platform::NumberOfWorkerThreads ()
 {
   return g_get_num_processors ();
 }
 
-void
-GumV8Platform::CallOnBackgroundThread (Task * task,
-                                       ExpectedRuntime expected_runtime)
+std::shared_ptr<TaskRunner>
+GumV8Platform::GetForegroundTaskRunner (Isolate * isolate)
 {
-  (void) expected_runtime;
+  return nullptr; // FIXME
+}
 
-  auto request = new GumV8PlainTaskRequest (this, nullptr, task);
+void
+GumV8Platform::CallOnWorkerThread (std::unique_ptr<Task> task)
+{
+  auto request = new GumV8PlainTaskRequest (this, nullptr, std::move (task));
 
   gum_script_scheduler_push_job_on_thread_pool (scheduler,
       (GumScriptJobFunc) HandleBackgroundTaskRequest, request, NULL);
 }
 
 void
+GumV8Platform::CallDelayedOnWorkerThread (std::unique_ptr<Task> task,
+                                          double delay_in_seconds)
+{
+  // FIXME
+}
+
+void
 GumV8Platform::CallOnForegroundThread (Isolate * for_isolate,
                                        Task * task)
 {
-  auto request = new GumV8PlainTaskRequest (this, for_isolate, task);
+  auto request = new GumV8PlainTaskRequest (this, for_isolate,
+      std::unique_ptr<Task> (task));
 
   auto source = g_idle_source_new ();
   g_source_set_priority (source, G_PRIORITY_DEFAULT);
@@ -602,7 +577,8 @@ GumV8Platform::CallDelayedOnForegroundThread (Isolate * for_isolate,
                                               Task * task,
                                               double delay_in_seconds)
 {
-  auto request = new GumV8PlainTaskRequest (this, for_isolate, task);
+  auto request = new GumV8PlainTaskRequest (this, for_isolate,
+      std::unique_ptr<Task> (task));
 
   auto source = g_timeout_source_new (delay_in_seconds * 1000.0);
   g_source_set_priority (source, G_PRIORITY_LOW);
@@ -623,8 +599,6 @@ GumV8Platform::CallIdleOnForegroundThread (Isolate * for_isolate,
 bool
 GumV8Platform::IdleTasksEnabled (Isolate * for_isolate)
 {
-  (void) for_isolate;
-
   return true;
 }
 
@@ -634,6 +608,12 @@ GumV8Platform::MonotonicallyIncreasingTime ()
   gint64 delta = g_get_monotonic_time () - start_time;
 
   return ((double) (delta / G_GINT64_CONSTANT (1000))) / 1000.0;
+}
+
+double
+GumV8Platform::CurrentClockTimeMillis ()
+{
+  return (double) (g_get_real_time () / G_GINT64_CONSTANT (1000));
 }
 
 MemoryBackend *

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2017 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2018 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -31,9 +31,12 @@ public:
   GumV8Bundle * GetDebugBundle () const { return debug_bundle; }
   GumScriptScheduler * GetScheduler () const { return scheduler; }
 
-  size_t NumberOfAvailableBackgroundThreads () override;
-  void CallOnBackgroundThread (v8::Task * task,
-      ExpectedRuntime expected_runtime) override;
+  int NumberOfWorkerThreads () override;
+  std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner (
+      v8::Isolate * isolate) override;
+  void CallOnWorkerThread (std::unique_ptr<v8::Task> task) override;
+  void CallDelayedOnWorkerThread (std::unique_ptr<v8::Task> task,
+      double delay_in_seconds) override;
   void CallOnForegroundThread (v8::Isolate * for_isolate,
       v8::Task * task) override;
   void CallDelayedOnForegroundThread (v8::Isolate * for_isolate,
@@ -42,6 +45,7 @@ public:
       v8::IdleTask * task) override;
   bool IdleTasksEnabled (v8::Isolate * for_isolate) override;
   double MonotonicallyIncreasingTime () override;
+  double CurrentClockTimeMillis () override;
   v8::MemoryBackend * GetMemoryBackend () override;
   v8::ThreadingBackend * GetThreadingBackend () override;
   v8::TracingController * GetTracingController () override;

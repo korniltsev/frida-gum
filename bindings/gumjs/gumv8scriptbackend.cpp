@@ -13,7 +13,6 @@
 
 #include <gum/guminterceptor.h>
 #include <string.h>
-#include <v8-debug.h>
 
 #define GUM_V8_SCRIPT_BACKEND_LOCK()   (g_mutex_lock (&priv->mutex))
 #define GUM_V8_SCRIPT_BACKEND_UNLOCK() (g_mutex_unlock (&priv->mutex))
