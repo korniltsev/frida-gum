@@ -14,8 +14,8 @@
 #include <v8-platform.h>
 
 class GumV8Operation;
-class GumV8TaskRequest;
 class GumV8MainContextOperation;
+class GumV8ThreadPoolOperation;
 class GumV8PlatformLocker;
 class GumV8PlatformUnlocker;
 
@@ -43,6 +43,10 @@ public:
       guint delay_in_milliseconds, std::function<void ()> f);
   std::shared_ptr<GumV8Operation> ScheduleOnJSThreadDelayed (
       guint delay_in_milliseconds, gint priority, std::function<void ()> f);
+  std::shared_ptr<GumV8Operation> ScheduleOnThreadPool (
+      std::function<void ()> f);
+  std::shared_ptr<GumV8Operation> ScheduleOnThreadPoolDelayed (
+      guint delay_in_milliseconds, std::function<void ()> f);
 
   int NumberOfWorkerThreads () override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner (
@@ -68,8 +72,9 @@ private:
   static void OnFatalError (const char * location, const char * message);
 
   static gboolean PerformMainContextOperation (gpointer data);
-  static gboolean ReleaseMainContextOperation (gpointer data);
-  static void HandleBackgroundTaskRequest (GumV8TaskRequest * request);
+  static void ReleaseMainContextOperation (gpointer data);
+  static void PerformThreadPoolOperation (gpointer data);
+  static void ReleaseThreadPoolOperation (gpointer data);
 
   GMutex lock;
   v8::Isolate * isolate;
@@ -86,6 +91,7 @@ private:
   v8::TracingController * tracing_controller;
 
   friend class GumV8MainContextOperation;
+  friend class GumV8ThreadPoolOperation;
   friend class GumV8PlatformLocker;
   friend class GumV8PlatformUnlocker;
 };
