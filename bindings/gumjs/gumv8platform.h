@@ -12,6 +12,7 @@
 
 #include <map>
 #include <v8-platform.h>
+#include <unordered_set>
 
 class GumV8Operation;
 class GumV8MainContextOperation;
@@ -83,6 +84,7 @@ private:
   GumV8Bundle * java_bundle;
   GumV8Bundle * debug_bundle;
   GumScriptScheduler * scheduler;
+  std::unordered_set<std::shared_ptr<GumV8MainContextOperation>> js_operations;
   std::map<v8::Isolate *, std::shared_ptr<v8::TaskRunner>> foreground_runners;
   const gint64 start_time;
   v8::ArrayBuffer::Allocator * array_buffer_allocator;
