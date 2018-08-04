@@ -25,7 +25,7 @@
     TEST_ENTRY_SIMPLE ("Core/Process", test_process, NAME)
 
 TEST_LIST_BEGIN (process)
-  PROCESS_TESTENTRY (process_threads)
+//  PROCESS_TESTENTRY (process_threads)
   PROCESS_TESTENTRY (process_threads_exclude_cloaked)
   PROCESS_TESTENTRY (process_modules)
   PROCESS_TESTENTRY (process_ranges)
