@@ -27,6 +27,7 @@
 TEST_LIST_BEGIN (process)
 //  PROCESS_TESTENTRY (process_threads)
   PROCESS_TESTENTRY (process_threads_exclude_cloaked)
+  PROCESS_TESTENTRY (process_cpu_type_from_pid)
   PROCESS_TESTENTRY (process_modules)
   PROCESS_TESTENTRY (process_ranges)
   PROCESS_TESTENTRY (process_ranges_exclude_cloaked)
@@ -163,6 +164,15 @@ PROCESS_TESTCASE (process_threads)
   done = TRUE;
   g_thread_join (thread_b);
   g_thread_join (thread_a);
+}
+
+PROCESS_TESTCASE (process_cpu_type_from_pid)
+{
+  pid_t p = 239;
+  GError *err = NULL;
+  GumCpuType t = gum_linux_cpu_type_from_pid(p, &err);
+  g_assert(!t);
+  g_printf("got %d", t);
 }
 
 PROCESS_TESTCASE (process_threads_exclude_cloaked)
